@@ -1,0 +1,33 @@
+data:
+  root: outputs/wam_synthetic_data
+  t_hist: 8
+  h_pred: 8
+  token_slots: 2
+  codebook_size: 64
+  d_feature: 64
+model:
+  d_model: 256
+  num_layers: 4
+  num_heads: 8
+  dropout: 0.1
+loss:
+  lambda_kl: 1.0
+  lambda_ce: 0.2
+train:
+  batch_size: 64
+  num_epochs: 5
+  max_steps: 500
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  seed: 42
+eval:
+  topk: [1, 5]
+  confidence_bins: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+synthetic:
+  enabled: true
+  train_episodes: 32
+  val_episodes: 8
+  length: 128
+  switch_prob: 0.12
+  noise_std: 0.2

@@ -43,15 +43,33 @@ def make_synthetic_wam_episode(
     ego_features = state_embeddings[states] + noise_std * torch.randn(
         length, d_feature, generator=gen
     )
+    exo_features = state_embeddings[states] + (noise_std * 0.5) * torch.randn(
+        length, d_feature, generator=gen
+    )
     timestamps = torch.arange(length).float()
+    phase_labels = (states % 5).long()
+    bucket_names = ("A_interaction", "B_loco", "C_active_view", "D_scene")
+    bucket = bucket_names[seed % len(bucket_names)]
 
     return {
         "episode_id": episode_id,
+        "take_id": episode_id,
         "ego_features": ego_features.float(),
+        "exo_features": exo_features.float(),
         "fact_token_ids": token_ids.long(),
         "fact_soft_probs": soft_probs.float(),
         "confidence": confidence.float(),
         "timestamps": timestamps,
+        "bucket": bucket,
+        "sampling_weight": 1.0,
+        "phase_labels": phase_labels,
+        "phase_label_names": {
+            0: "approach",
+            1: "reach",
+            2: "carry",
+            3: "place",
+            4: "release",
+        },
     }
 
 

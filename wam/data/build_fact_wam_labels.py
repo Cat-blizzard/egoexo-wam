@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -10,148 +10,359 @@ from typing import Any, Dict, Iterable, List
 import numpy as np
 import torch
 
+from wam.utils import write_json
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build dense episode-level WAM labels from frozen FACT.")
-    parser.add_argument("--fact-checkpoint", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        description="Build WAM episode labels from sxh-kk/fact-tokenizer token exports."
+    )
+    parser.add_argument("--source-npz", type=Path, required=True, help="FACT paired-transition NPZ.")
     parser.add_argument(
-        "--fact-repo-root",
+        "--tokens-npz",
         type=Path,
         default=None,
-        help="Path to the FACT tokenizer repo. Defaults to FACT_REPO_ROOT if set.",
+        help="Path to ego_tokens.npz exported by scripts/extract_fact_tokens.py.",
     )
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, default=Path("data/fact_wam_labels"))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("data/fact_wam_labels"),
+        help="Output root with split subdirectories.",
+    )
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--ego-feature-npz", type=Path, default=None)
+    parser.add_argument("--exo-feature-npz", type=Path, default=None)
+    parser.add_argument("--ego-feature-key", type=str, default="ego_features")
+    parser.add_argument("--exo-feature-key", type=str, default="exo_features")
+    parser.add_argument(
+        "--derive-raw-frame-features",
+        action="store_true",
+        help="Sandbox-only fallback: derive small RGB delta features from raw ego/exo arrays.",
+    )
+    parser.add_argument("--min-episode-length", type=int, default=2)
+    parser.add_argument("--fact-repo-root", type=Path, default=Path("D:/fact-tokenizer"))
+    parser.add_argument("--fact-checkpoint", type=Path, default=None)
+    parser.add_argument("--extract-tokens", action="store_true")
+    parser.add_argument("--extract-output-dir", type=Path, default=None)
+    parser.add_argument("--source-view-keys", nargs="*", default=None)
+    parser.add_argument("--view-names", nargs=2, default=None)
+    parser.add_argument("--videos-layout", default="VBTCHW")
+    parser.add_argument("--frame-pair", choices=["first-last", "first-next"], default="first-last")
+    parser.add_argument("--start-index", type=int, default=0)
+    parser.add_argument("--resize", type=int, default=224)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--skip-recon-metrics", action="store_true")
     return parser.parse_args()
 
 
-def load_fact_model_from_repo(fact_repo_root: Path | None, checkpoint_path: Path, device: torch.device):
-    root = fact_repo_root or (Path(os.environ["FACT_REPO_ROOT"]) if "FACT_REPO_ROOT" in os.environ else None)
-    if root is None:
-        raise ValueError("Pass --fact-repo-root or set FACT_REPO_ROOT to the FACT tokenizer repo path.")
-    root = root.resolve()
-    if not (root / "latent_action_model").exists():
-        raise FileNotFoundError(f"{root} does not look like the FACT tokenizer repo root.")
-    sys.path.insert(0, str(root))
-    from latent_action_model.scripts.generate_fact_labels import load_fact_model
-
-    return load_fact_model(checkpoint_path, device)
+def load_npz(path: Path) -> Dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as data:
+        return {key: data[key] for key in data.files}
 
 
-def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device | str) -> Dict[str, torch.Tensor]:
-    return {key: value.to(device) for key, value in batch.items()}
+def require_keys(arrays: Dict[str, np.ndarray], required: Iterable[str], path: Path) -> None:
+    missing = [key for key in required if key not in arrays]
+    if missing:
+        raise KeyError(f"{path} missing required keys: {missing}")
 
 
-def read_manifest(path: Path) -> List[Dict[str, Any]]:
-    if path.suffix == ".jsonl":
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    data = json.loads(path.read_text())
-    if isinstance(data, dict) and "episodes" in data:
-        return data["episodes"]
-    if isinstance(data, list):
-        return data
-    raise ValueError("Manifest must be JSONL, a JSON list, or a JSON object with episodes.")
+def run_fact_extractor(args: argparse.Namespace) -> Path:
+    if args.fact_checkpoint is None:
+        raise ValueError("--extract-tokens requires --fact-checkpoint")
+    repo_root = args.fact_repo_root.resolve()
+    extractor = repo_root / "scripts" / "extract_fact_tokens.py"
+    if not extractor.exists():
+        raise FileNotFoundError(f"{extractor} not found; expected sxh-kk/fact-tokenizer checkout")
+
+    output_dir = args.extract_output_dir or (args.output_root / "_fact_token_exports" / args.split)
+    command = [
+        sys.executable,
+        str(extractor),
+        "--checkpoint",
+        str(args.fact_checkpoint),
+        "--input-npz",
+        str(args.source_npz),
+        "--output-dir",
+        str(output_dir),
+        "--videos-layout",
+        args.videos_layout,
+        "--frame-pair",
+        args.frame_pair,
+        "--start-index",
+        str(args.start_index),
+        "--resize",
+        str(args.resize),
+        "--batch-size",
+        str(args.batch_size),
+        "--device",
+        args.device,
+    ]
+    if args.source_view_keys:
+        command.extend(["--source-view-keys", *args.source_view_keys])
+    if args.view_names:
+        command.extend(["--view-names", *args.view_names])
+    if args.skip_recon_metrics:
+        command.append("--skip-recon-metrics")
+    subprocess.run(command, cwd=repo_root, check=True)
+    return output_dir / "ego_tokens.npz"
 
 
-def batched(items: List[Dict[str, torch.Tensor]], batch_size: int) -> Iterable[Dict[str, torch.Tensor]]:
-    for start in range(0, len(items), batch_size):
-        chunk = items[start : start + batch_size]
-        yield {
-            key: torch.stack([sample[key] for sample in chunk], dim=0)
-            for key in ("ego_context", "ego_future", "exo_context", "exo_future")
-        }
+def flatten_fact_tokens(tokens: Dict[str, np.ndarray]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    require_keys(tokens, ("indices", "soft_probs", "confidence"), Path("tokens-npz"))
+    indices = torch.from_numpy(np.asarray(tokens["indices"])).long()
+    soft_probs = torch.from_numpy(np.asarray(tokens["soft_probs"])).float()
+    confidence = torch.from_numpy(np.asarray(tokens["confidence"])).float()
+    if indices.ndim == 2:
+        indices = indices[:, None, :]
+    if confidence.ndim == 2:
+        confidence = confidence[:, None, :]
+    if soft_probs.ndim == 3:
+        soft_probs = soft_probs[:, None, :, :]
+    if indices.ndim != 3:
+        raise ValueError(f"indices must be [N, transition, slot] or [N, slot], got {tuple(indices.shape)}")
+    if soft_probs.ndim != 4:
+        raise ValueError(f"soft_probs must be [N, transition, slot, K], got {tuple(soft_probs.shape)}")
+    if confidence.shape != indices.shape:
+        raise ValueError(f"confidence shape {tuple(confidence.shape)} does not match indices {tuple(indices.shape)}")
+    if soft_probs.shape[:3] != indices.shape:
+        raise ValueError(f"soft_probs shape {tuple(soft_probs.shape)} does not match indices {tuple(indices.shape)}")
+
+    sample_count, transition_count, slot_count = indices.shape
+    codebook_size = soft_probs.shape[-1]
+    flat_indices = indices.reshape(sample_count, transition_count * slot_count)
+    flat_soft = soft_probs.reshape(sample_count, transition_count * slot_count, codebook_size)
+    flat_confidence = confidence.reshape(sample_count, transition_count * slot_count)
+    return flat_indices, flat_soft, flat_confidence
 
 
-def build_episode_samples(ego_features: torch.Tensor, exo_features: torch.Tensor, context_len: int, future_len: int):
-    samples = []
-    valid_indices = []
-    length = ego_features.shape[0]
-    for current_t in range(context_len - 1, length - future_len):
-        samples.append(
-            {
-                "ego_context": ego_features[current_t - context_len + 1 : current_t + 1],
-                "ego_future": ego_features[current_t + 1 : current_t + future_len + 1],
-                "exo_context": exo_features[current_t - context_len + 1 : current_t + 1],
-                "exo_future": exo_features[current_t + 1 : current_t + future_len + 1],
-            }
+def _video_to_bthwc(array: np.ndarray) -> np.ndarray:
+    if array.ndim != 5:
+        raise ValueError(f"Expected raw video array [B,T,...], got shape {array.shape}")
+    if array.shape[-1] in (1, 3):
+        return array
+    if array.shape[2] in (1, 3):
+        return np.transpose(array, (0, 1, 3, 4, 2))
+    raise ValueError(f"Cannot infer channel axis for raw video shape {array.shape}")
+
+
+def derive_rgb_delta_features(array: np.ndarray) -> torch.Tensor:
+    videos = _video_to_bthwc(array).astype(np.float32)
+    if videos.size and videos.max() > 1.5:
+        videos = videos / 255.0
+    current = videos[:, 0]
+    future = videos[:, -1]
+    cur_mean = current.mean(axis=(1, 2))
+    fut_mean = future.mean(axis=(1, 2))
+    delta = fut_mean - cur_mean
+    cur_std = current.std(axis=(1, 2))
+    features = np.concatenate([cur_mean, fut_mean, delta, cur_std], axis=-1)
+    return torch.from_numpy(features).float()
+
+
+def load_feature_array(
+    source: Dict[str, np.ndarray],
+    feature_npz: Path | None,
+    feature_key: str,
+    raw_key: str,
+    derive_raw: bool,
+) -> torch.Tensor:
+    feature_source = load_npz(feature_npz) if feature_npz is not None else source
+    if feature_key in feature_source:
+        return torch.from_numpy(np.asarray(feature_source[feature_key])).float()
+    if raw_key in feature_source and derive_raw:
+        return derive_rgb_delta_features(feature_source[raw_key])
+    raise KeyError(
+        f"Could not find '{feature_key}'. Pass --{raw_key}-feature-npz with that key, "
+        f"or use --derive-raw-frame-features for sandbox-only RGB features."
+    )
+
+
+def source_metadata(source: Dict[str, np.ndarray], sample_count: int) -> Dict[str, Any]:
+    take_uid = (
+        np.asarray(source["take_uid"]).astype(str)
+        if "take_uid" in source
+        else np.asarray([str(index) for index in range(sample_count)])
+    )
+    timestamp = (
+        np.asarray(source["timestamp"], dtype=np.float32)
+        if "timestamp" in source
+        else np.arange(sample_count, dtype=np.float32)
+    )
+    sample_id = (
+        np.asarray(source["sample_id"]).astype(str)
+        if "sample_id" in source
+        else np.asarray([str(index) for index in range(sample_count)])
+    )
+    if len(take_uid) != sample_count or len(timestamp) != sample_count or len(sample_id) != sample_count:
+        raise ValueError("source metadata length must match token sample count")
+    return {"take_uid": take_uid, "timestamp": timestamp, "sample_id": sample_id}
+
+
+def optional_per_sample(source: Dict[str, np.ndarray], key: str, sample_count: int) -> np.ndarray | None:
+    if key not in source:
+        return None
+    value = np.asarray(source[key])
+    if value.shape[:1] != (sample_count,):
+        raise ValueError(f"{key} must have first dimension {sample_count}, got {value.shape}")
+    return value
+
+
+def first_per_sample(source: Dict[str, np.ndarray], keys: Iterable[str], sample_count: int) -> np.ndarray | None:
+    for key in keys:
+        if key in source:
+            return optional_per_sample(source, key, sample_count)
+    return None
+
+
+def scalar_string(source: Dict[str, np.ndarray], key: str) -> str | None:
+    if key not in source:
+        return None
+    value = np.asarray(source[key])
+    if value.shape == ():
+        return str(value.item())
+    return None
+
+
+def build_wam_episodes_from_fact_npz(
+    source_npz: Path,
+    tokens_npz: Path,
+    output_root: Path,
+    split: str,
+    ego_feature_npz: Path | None = None,
+    exo_feature_npz: Path | None = None,
+    ego_feature_key: str = "ego_features",
+    exo_feature_key: str = "exo_features",
+    derive_raw_frame_features: bool = False,
+    min_episode_length: int = 2,
+) -> Dict[str, Any]:
+    source = load_npz(source_npz)
+    tokens = load_npz(tokens_npz)
+    token_ids, soft_probs, confidence = flatten_fact_tokens(tokens)
+    sample_count = int(token_ids.shape[0])
+    metadata = source_metadata(source, sample_count)
+
+    ego_features = load_feature_array(
+        source,
+        ego_feature_npz,
+        ego_feature_key,
+        raw_key="ego",
+        derive_raw=derive_raw_frame_features,
+    )
+    if ego_features.shape[0] != sample_count:
+        raise ValueError(f"ego features have {ego_features.shape[0]} rows, expected {sample_count}")
+
+    exo_features = None
+    try:
+        exo_features = load_feature_array(
+            source,
+            exo_feature_npz,
+            exo_feature_key,
+            raw_key="exo",
+            derive_raw=derive_raw_frame_features,
         )
-        valid_indices.append(current_t)
-    return samples, valid_indices
+        if exo_features.shape[0] != sample_count:
+            raise ValueError(f"exo features have {exo_features.shape[0]} rows, expected {sample_count}")
+    except KeyError:
+        exo_features = None
 
+    phase_labels = first_per_sample(source, ("phase_labels", "phase_label"), sample_count)
+    bucket_labels = first_per_sample(source, ("bucket_labels", "bucket_label"), sample_count)
+    if bucket_labels is None and "bucket" in source and np.asarray(source["bucket"]).shape[:1] == (sample_count,):
+        bucket_labels = optional_per_sample(source, "bucket", sample_count)
+    bucket_scalar = scalar_string(source, "bucket")
+    sampling_weight = first_per_sample(source, ("sampling_weight", "sampling_weights"), sample_count)
+    phase_label_names = None
+    if "phase_label_names_json" in source:
+        phase_label_names = json.loads(str(np.asarray(source["phase_label_names_json"]).item()))
 
-def load_episode_features(record: Dict[str, Any], manifest_path: Path) -> Dict[str, Any]:
-    feature_path = Path(record["feature_path"])
-    if not feature_path.is_absolute():
-        feature_path = manifest_path.parent / feature_path
-    with np.load(feature_path) as arrays:
-        ego_features = torch.from_numpy(arrays["ego_features"]).float()
-        exo_features = torch.from_numpy(arrays["exo_features"]).float()
-        timestamps = arrays["timestamps"].tolist() if "timestamps" in arrays else None
-    return {
-        "episode_id": str(record.get("episode_id", feature_path.stem)),
-        "ego_features": ego_features,
-        "exo_features": exo_features,
-        "timestamps": timestamps,
+    output_dir = output_root / split
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_path in output_dir.glob("*.pt"):
+        stale_path.unlink()
+
+    take_uid = metadata["take_uid"]
+    timestamp = metadata["timestamp"]
+    unique_takes = sorted(set(take_uid.tolist()))
+    written = 0
+    skipped_short = 0
+    for take in unique_takes:
+        indices = np.nonzero(take_uid == take)[0]
+        order = indices[np.argsort(timestamp[indices], kind="stable")]
+        if len(order) < min_episode_length:
+            skipped_short += 1
+            continue
+        order_tensor = torch.as_tensor(order, dtype=torch.long)
+        episode: Dict[str, Any] = {
+            "episode_id": str(take),
+            "take_id": str(take),
+            "ego_features": ego_features.index_select(0, order_tensor).float(),
+            "fact_token_ids": token_ids.index_select(0, order_tensor).long(),
+            "fact_soft_probs": soft_probs.index_select(0, order_tensor).float(),
+            "confidence": confidence.index_select(0, order_tensor).float(),
+            "timestamps": timestamp[order].astype(float).tolist(),
+            "sample_ids": metadata["sample_id"][order].astype(str).tolist(),
+            "source_npz": str(source_npz),
+            "tokens_npz": str(tokens_npz),
+            "shape_semantics": "FACT samples grouped by take_uid and sorted by timestamp; FACT transition dims flattened into WAM slots.",
+        }
+        if exo_features is not None:
+            episode["exo_features"] = exo_features.index_select(0, order_tensor).float()
+        if phase_labels is not None:
+            episode["phase_labels"] = torch.as_tensor(phase_labels[order]).long()
+        if phase_label_names is not None:
+            episode["phase_label_names"] = phase_label_names
+        if bucket_labels is not None:
+            episode["bucket_labels"] = [str(value) for value in bucket_labels[order].tolist()]
+        elif bucket_scalar is not None:
+            episode["bucket"] = bucket_scalar
+        if sampling_weight is not None:
+            episode["sampling_weight"] = torch.as_tensor(sampling_weight[order]).float()
+
+        safe_take = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(take))
+        torch.save(episode, output_dir / f"{written:06d}_{safe_take}.pt")
+        written += 1
+
+    report = {
+        "source_npz": str(source_npz),
+        "tokens_npz": str(tokens_npz),
+        "output_dir": str(output_dir),
+        "split": split,
+        "sample_count": sample_count,
+        "take_count": len(unique_takes),
+        "episodes_written": written,
+        "skipped_short_episodes": skipped_short,
+        "token_slots": int(token_ids.shape[-1]),
+        "codebook_size": int(soft_probs.shape[-1]),
+        "ego_feature_dim": int(ego_features.shape[-1]),
+        "exo_feature_dim": int(exo_features.shape[-1]) if exo_features is not None else None,
+        "derive_raw_frame_features": bool(derive_raw_frame_features),
     }
+    write_json(output_dir / "_build_report.json", report)
+    return report
 
 
-@torch.no_grad()
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
-    model = load_fact_model_from_repo(args.fact_repo_root, args.fact_checkpoint, device)
-    records = read_manifest(args.manifest)
-    output_dir = args.output_root / args.split
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for episode_idx, record in enumerate(records):
-        episode = load_episode_features(record, args.manifest)
-        samples, valid_indices = build_episode_samples(
-            episode["ego_features"],
-            episode["exo_features"],
-            model.context_len,
-            model.future_len,
-        )
-        if not samples:
-            continue
-        store: Dict[str, List[torch.Tensor]] = {
-            "ego_token_id": [],
-            "ego_soft_assignment": [],
-            "exo_soft_assignment": [],
-            "ego_confidence_weight": [],
-            "exo_confidence_weight": [],
-        }
-        for batch in batched(samples, args.batch_size):
-            batch = move_batch_to_device(batch, device)
-            metadata = model.token_metadata(batch)
-            for key in store:
-                store[key].append(metadata[key].detach().cpu())
-
-        ego_token_ids = torch.cat(store["ego_token_id"], dim=0)
-        ego_soft = torch.cat(store["ego_soft_assignment"], dim=0)
-        exo_soft = torch.cat(store["exo_soft_assignment"], dim=0)
-        ego_conf = torch.cat(store["ego_confidence_weight"], dim=0)
-        exo_conf = torch.cat(store["exo_confidence_weight"], dim=0)
-
-        valid_indices_tensor = torch.tensor(valid_indices, dtype=torch.long)
-        timestamps = None
-        if episode["timestamps"] is not None:
-            timestamps = [episode["timestamps"][idx] for idx in valid_indices]
-
-        wam_episode = {
-            "episode_id": episode["episode_id"],
-            "ego_features": episode["ego_features"][valid_indices_tensor],
-            "fact_token_ids": ego_token_ids.long(),
-            "fact_soft_probs": 0.5 * (ego_soft + exo_soft),
-            "confidence": 0.5 * (ego_conf + exo_conf),
-            "timestamps": timestamps,
-            "source_feature_path": record["feature_path"],
-        }
-        torch.save(wam_episode, output_dir / f"{episode_idx:06d}_{episode['episode_id']}.pt")
-    print(f"saved WAM labels to: {output_dir}")
+    tokens_npz = args.tokens_npz
+    if args.extract_tokens:
+        tokens_npz = run_fact_extractor(args)
+    if tokens_npz is None:
+        raise ValueError("Pass --tokens-npz or use --extract-tokens with --fact-checkpoint")
+    report = build_wam_episodes_from_fact_npz(
+        source_npz=args.source_npz,
+        tokens_npz=tokens_npz,
+        output_root=args.output_root,
+        split=args.split,
+        ego_feature_npz=args.ego_feature_npz,
+        exo_feature_npz=args.exo_feature_npz,
+        ego_feature_key=args.ego_feature_key,
+        exo_feature_key=args.exo_feature_key,
+        derive_raw_frame_features=args.derive_raw_frame_features,
+        min_episode_length=args.min_episode_length,
+    )
+    print(f"saved WAM labels to: {report['output_dir']}")
 
 
 if __name__ == "__main__":

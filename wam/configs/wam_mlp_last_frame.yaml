@@ -10,9 +10,9 @@ data:
     exclude_buckets: null
     min_confidence: null
 model:
-  arch: transformer
+  arch: mlp_last_frame
   d_model: 256
-  num_layers: 4
+  num_layers: 3
   num_heads: 8
   dropout: 0.1
 loss:

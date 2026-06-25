@@ -11,8 +11,8 @@ from wam.data.fact_wam_dataset import FactWamDataset, move_wam_batch_to_device
 from wam.data.synthetic_wam import write_synthetic_wam_dataset
 from wam.eval import evaluate_model
 from wam.losses.wam_losses import wam_loss
-from wam.models.ego_only_wam import EgoOnlyWAM
-from wam.utils import load_yaml_config, write_json
+from wam.models.ego_only_wam import EgoExoWAM, EgoLastFrameMLP, EgoOnlyWAM
+from wam.utils import dataset_filter_kwargs, load_yaml_config, write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,17 +27,30 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_model(config: Dict[str, Any], train_dataset: FactWamDataset) -> EgoOnlyWAM:
-    return EgoOnlyWAM(
-        d_feature=train_dataset.d_feature,
-        d_model=config["model"]["d_model"],
-        num_layers=config["model"]["num_layers"],
-        num_heads=config["model"]["num_heads"],
-        h_pred=config["data"]["h_pred"],
-        token_slots=train_dataset.token_slots,
-        codebook_size=train_dataset.codebook_size,
-        t_hist=config["data"]["t_hist"],
-        dropout=config["model"]["dropout"],
-    )
+    arch = config["model"].get("arch", "transformer")
+    model_cls = {
+        "transformer": EgoOnlyWAM,
+        "mlp_last_frame": EgoLastFrameMLP,
+        "ego_exo_transformer": EgoExoWAM,
+    }.get(arch)
+    if model_cls is None:
+        raise ValueError(f"Unknown model.arch={arch!r}")
+    model_kwargs = {
+        "d_feature": train_dataset.d_feature,
+        "d_model": config["model"]["d_model"],
+        "num_layers": config["model"]["num_layers"],
+        "num_heads": config["model"]["num_heads"],
+        "h_pred": config["data"]["h_pred"],
+        "token_slots": train_dataset.token_slots,
+        "codebook_size": train_dataset.codebook_size,
+        "t_hist": config["data"]["t_hist"],
+        "dropout": config["model"]["dropout"],
+    }
+    if arch == "ego_exo_transformer":
+        if train_dataset.d_exo_feature is None:
+            raise ValueError("model.arch=ego_exo_transformer requires episode exo_features")
+        model_kwargs["d_exo_feature"] = train_dataset.d_exo_feature
+    return model_cls(**model_kwargs)
 
 
 def main() -> None:
@@ -63,8 +76,21 @@ def main() -> None:
             seed=config["train"]["seed"],
         )
 
-    train_dataset = FactWamDataset(data_root, "train", config["data"]["t_hist"], config["data"]["h_pred"])
-    val_dataset = FactWamDataset(data_root, "val", config["data"]["t_hist"], config["data"]["h_pred"])
+    filter_kwargs = dataset_filter_kwargs(config)
+    train_dataset = FactWamDataset(
+        data_root,
+        "train",
+        config["data"]["t_hist"],
+        config["data"]["h_pred"],
+        **filter_kwargs,
+    )
+    val_dataset = FactWamDataset(
+        data_root,
+        "val",
+        config["data"]["t_hist"],
+        config["data"]["h_pred"],
+        **filter_kwargs,
+    )
     train_loader = DataLoader(train_dataset, batch_size=config["train"]["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config["train"]["batch_size"], shuffle=False)
 
@@ -83,12 +109,13 @@ def main() -> None:
     while step < max_steps:
         for batch in train_loader:
             batch = move_wam_batch_to_device(batch, device)
-            outputs = model(batch["ego_features"])
+            outputs = model(batch["ego_features"], batch.get("exo_features"))
+            loss_confidence = batch["confidence"] * batch["sample_weight"].view(-1, 1, 1)
             loss, loss_parts = wam_loss(
                 outputs["logits"],
                 batch["target_soft_probs"],
                 batch["target_token_ids"],
-                batch["confidence"],
+                loss_confidence,
                 lambda_kl=config["loss"]["lambda_kl"],
                 lambda_ce=config["loss"]["lambda_ce"],
             )
@@ -118,7 +145,10 @@ def main() -> None:
         "codebook_size": train_dataset.codebook_size,
         "t_hist": config["data"]["t_hist"],
         "dropout": config["model"]["dropout"],
+        "arch": config["model"].get("arch", "transformer"),
     }
+    if config["model"].get("arch") == "ego_exo_transformer":
+        model_config["d_exo_feature"] = train_dataset.d_exo_feature
     checkpoint = {
         "model_state": model.state_dict(),
         "model_config": model_config,
@@ -134,6 +164,8 @@ def main() -> None:
         device,
         topk=list(config["eval"]["topk"]),
         confidence_bins=list(config["eval"]["confidence_bins"]),
+        calibration_bins=list(config["eval"].get("calibration_bins", config["eval"]["confidence_bins"])),
+        rare_code_quantile=float(config["eval"].get("rare_code_quantile", 0.2)),
     )
     write_json(output_dir / "metrics.json", {"train": train_log, "eval": eval_results})
     write_json(output_dir / "config.json", config)

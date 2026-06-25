@@ -41,7 +41,7 @@ def main() -> None:
     predictions: List[Dict[str, Any]] = []
     for batch in loader:
         batch = move_wam_batch_to_device(batch, args.device)
-        outputs = model(batch["ego_features"])
+        outputs = model(batch["ego_features"], batch.get("exo_features"))
         probs = outputs["probs"]
         top = torch.topk(probs, k=min(args.topk, probs.shape[-1]), dim=-1)
         batch_size_actual = probs.shape[0]
@@ -57,6 +57,10 @@ def main() -> None:
                     "entropy": (-(probs[idx] * probs[idx].clamp_min(1e-8).log()).sum(dim=-1)).detach().cpu(),
                     "target_token_ids": batch["target_token_ids"][idx].detach().cpu(),
                     "confidence": batch["confidence"][idx].detach().cpu(),
+                    "target_phase_labels": batch["target_phase_labels"][idx].detach().cpu(),
+                    "take_id": batch["take_id"][idx],
+                    "bucket": batch["bucket"][idx],
+                    "timestamp": float(batch["timestamp"][idx].detach().cpu()),
                 }
             )
 
